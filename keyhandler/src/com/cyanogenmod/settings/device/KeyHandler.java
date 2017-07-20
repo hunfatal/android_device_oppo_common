@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2015-2016 The CyanogenMod Project
+ *               2017 The MoKee Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,36 +18,39 @@
 package com.cyanogenmod.settings.device;
 
 import android.Manifest;
-import android.app.NotificationManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Resources;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
-import android.hardware.camera2.CameraAccessException;
-import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraManager;
-import android.media.AudioManager;
 import android.media.session.MediaSessionLegacyHelper;
 import android.os.Handler;
 import android.os.Message;
 import android.os.PowerManager;
 import android.os.PowerManager.WakeLock;
 import android.os.SystemClock;
-import android.os.SystemProperties;
 import android.os.Vibrator;
 import android.provider.Settings;
-import android.service.notification.ZenModeConfig;
 import android.util.Log;
 import android.util.SparseIntArray;
 import android.view.KeyEvent;
 
 import com.android.internal.os.DeviceKeyHandler;
-import com.android.internal.util.ArrayUtils;
+
+import java.util.Arrays;
 
 import cyanogenmod.providers.CMSettings;
+
+import org.cyanogenmod.settings.device.SliderControllerBase;
+import org.cyanogenmod.settings.device.slider.NotificationController;
+import org.cyanogenmod.settings.device.slider.FlashlightController;
+import org.cyanogenmod.settings.device.slider.BrightnessController;
+import org.cyanogenmod.settings.device.slider.RotationController;
+import org.cyanogenmod.settings.device.slider.RingerController;
 
 public class KeyHandler implements DeviceKeyHandler {
 
@@ -55,32 +59,17 @@ public class KeyHandler implements DeviceKeyHandler {
 
     // Supported scancodes
     private static final int FLIP_CAMERA_SCANCODE = 249;
-    private static final int MODE_TOTAL_SILENCE = 600;
-    private static final int MODE_ALARMS_ONLY = 601;
-    private static final int MODE_PRIORITY_ONLY = 602;
-    private static final int MODE_NONE = 603;
-    private static final int MODE_VIBRATE = 604;
-    private static final int MODE_RING = 605;
-
-    private static final String PROP_IGNORE_AUTO = "persist.op.slider_ignore_auto";
 
     private static final int GESTURE_WAKELOCK_DURATION = 3000;
 
-    private static final SparseIntArray sSupportedSliderModes = new SparseIntArray();
-    static {
-        sSupportedSliderModes.put(MODE_TOTAL_SILENCE, Settings.Global.ZEN_MODE_NO_INTERRUPTIONS);
-        sSupportedSliderModes.put(MODE_ALARMS_ONLY, Settings.Global.ZEN_MODE_ALARMS);
-        sSupportedSliderModes.put(MODE_PRIORITY_ONLY,
-                Settings.Global.ZEN_MODE_IMPORTANT_INTERRUPTIONS);
-        sSupportedSliderModes.put(MODE_NONE, Settings.Global.ZEN_MODE_OFF);
-        sSupportedSliderModes.put(MODE_VIBRATE, AudioManager.RINGER_MODE_VIBRATE);
-        sSupportedSliderModes.put(MODE_RING, AudioManager.RINGER_MODE_NORMAL);
-    }
+    private static final String ACTION_UPDATE_SLIDER_SETTINGS
+            = "com.cyanogenmod.settings.device.UPDATE_SLIDER_SETTINGS";
+
+    private static final String EXTRA_SLIDER_USAGE = "usage";
+    private static final String EXTRA_SLIDER_ACTIONS = "actions";
 
     private final Context mContext;
     private final PowerManager mPowerManager;
-    private final AudioManager mAudioManager;
-    private final NotificationManager mNotificationManager;
     private EventHandler mEventHandler;
     private SensorManager mSensorManager;
     private Sensor mProximitySensor;
@@ -90,12 +79,57 @@ public class KeyHandler implements DeviceKeyHandler {
     private int mProximityTimeOut;
     private boolean mProximityWakeSupported;
 
+    private final NotificationController mNotificationController;
+    private final FlashlightController mFlashlightController;
+    private final BrightnessController mBrightnessController;
+    private final RotationController mRotationController;
+    private final RingerController mRingerController;
+
+    private SliderControllerBase mSliderController;
+
+    private final BroadcastReceiver mUpdateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            int usage = intent.getIntExtra(EXTRA_SLIDER_USAGE, 0);
+            int[] actions = intent.getIntArrayExtra(EXTRA_SLIDER_ACTIONS);
+
+            Log.d(TAG, "update usage " + usage + " with actions " +
+                    Arrays.toString(actions));
+
+            if (mSliderController != null) {
+                mSliderController.reset();
+            }
+
+            switch (usage) {
+                case NotificationController.ID:
+                    mSliderController = mNotificationController;
+                    mSliderController.update(actions);
+                    break;
+                case FlashlightController.ID:
+                    mSliderController = mFlashlightController;
+                    mSliderController.update(actions);
+                    break;
+                case BrightnessController.ID:
+                    mSliderController = mBrightnessController;
+                    mSliderController.update(actions);
+                    break;
+                case RotationController.ID:
+                    mSliderController = mRotationController;
+                    mSliderController.update(actions);
+                    break;
+                case RingerController.ID:
+                    mSliderController = mRingerController;
+                    mSliderController.update(actions);
+                    break;
+            }
+
+            mSliderController.restoreState();
+        }
+    };
+
     public KeyHandler(Context context) {
         mContext = context;
         mPowerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-        mNotificationManager
-                = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         mEventHandler = new EventHandler();
         mGestureWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
                 "GestureWakeLock");
@@ -117,6 +151,15 @@ public class KeyHandler implements DeviceKeyHandler {
         if (mVibrator == null || !mVibrator.hasVibrator()) {
             mVibrator = null;
         }
+
+        mNotificationController = new NotificationController(context);
+        mFlashlightController = new FlashlightController(context);
+        mBrightnessController = new BrightnessController(context);
+        mRotationController = new RotationController(context);
+        mRingerController = new RingerController(context);
+
+        mContext.registerReceiver(mUpdateReceiver,
+                new IntentFilter(ACTION_UPDATE_SLIDER_SETTINGS));
     }
 
     private class EventHandler extends Handler {
@@ -141,8 +184,9 @@ public class KeyHandler implements DeviceKeyHandler {
     public boolean handleKeyEvent(KeyEvent event) {
         int scanCode = event.getScanCode();
         boolean isKeySupported = scanCode == FLIP_CAMERA_SCANCODE;
-        boolean isSliderModeSupported = sSupportedSliderModes.indexOfKey(scanCode) >= 0;
-        if (!isKeySupported && !isSliderModeSupported) {
+        boolean isSliderControllerSupported = mSliderController != null &&
+                mSliderController.isSupported(scanCode);
+        if (!isKeySupported && !isSliderControllerSupported) {
             return false;
         }
 
@@ -159,30 +203,8 @@ public class KeyHandler implements DeviceKeyHandler {
             return true;
         }
 
-        if (isSliderModeSupported) {
-            boolean ignoreAuto = SystemProperties.get(PROP_IGNORE_AUTO).equals("true");
-            boolean isAutoModeActive = false;
-
-            if (ignoreAuto) {
-                ZenModeConfig zmc = mNotificationManager.getZenModeConfig();
-                int len = zmc.automaticRules.size();
-                for (int i = 0; i < len; i++) {
-                    if (zmc.automaticRules.valueAt(i).isAutomaticActive()) {
-                        isAutoModeActive = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!isAutoModeActive) {
-                if (scanCode <= MODE_NONE) {
-                    mNotificationManager.setZenMode(sSupportedSliderModes.get(scanCode), null, TAG);
-                } else {
-                    mAudioManager.setRingerModeInternal(sSupportedSliderModes.get(scanCode));
-                }
-
-                doHapticFeedback();
-            }
+        if (isSliderControllerSupported) {
+            mSliderController.processEvent(scanCode);
         } else if (!mEventHandler.hasMessages(GESTURE_REQUEST)) {
             Message msg = getMessageForKeyEvent(scanCode);
             boolean defaultProximity = mContext.getResources().getBoolean(
